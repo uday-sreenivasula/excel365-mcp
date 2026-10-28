@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -36,6 +37,12 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
+# Try IPv4 addresses before IPv6. Where IPv6 is broken (it is on some office networks), Python otherwise waits
+# Windows' 21 s connect timeout on every IPv6 address before falling back - minutes per call - while browsers,
+# which race both, look perfectly fast. IPv6 is still used when there is no IPv4 route.
+_getaddrinfo = socket.getaddrinfo
+socket.getaddrinfo = lambda *a, **k: sorted(_getaddrinfo(*a, **k), key=lambda ai: ai[0] != socket.AF_INET)
+
 _LIB = os.path.join(os.environ.get("LOCALAPPDATA", ""), "excel365", "lib")
 if os.path.isdir(_LIB):
     sys.path.insert(0, _LIB)
@@ -45,7 +52,7 @@ from openpyxl.formula.tokenizer import Token, Tokenizer
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter, column_index_from_string, range_boundaries
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 TENANT = os.environ.get("EXCEL365_TENANT", "").strip() or "organizations"  # "organizations" = any work/school account
 CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Microsoft Graph Command Line Tools

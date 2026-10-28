@@ -1,6 +1,6 @@
 {
   "name": "excel365",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Live read/write connector for co-authored Excel 365 workbooks on SharePoint/OneDrive: map, find, trace, guarded formula edits with undo, change tracking and error checks. Windows only.",
   "author": {
     "name": "Uday Sreenivasula",
