@@ -1,0 +1,14 @@
+{
+  "name": "excel365-mcp",
+  "owner": {
+    "name": "Uday Sreenivasula",
+    "url": "https://github.com/uday-sreenivasula"
+  },
+  "plugins": [
+    {
+      "name": "excel365",
+      "source": "./",
+      "description": "Live read/write connector for co-authored Excel 365 workbooks on SharePoint/OneDrive. Windows only."
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "excel365",
+  "version": "1.3.1",
+  "description": "Live read/write connector for co-authored Excel 365 workbooks on SharePoint/OneDrive: map, find, trace, guarded formula edits with undo, change tracking and error checks. Windows only.",
+  "author": {
+    "name": "Uday Sreenivasula",
+    "url": "https://github.com/uday-sreenivasula"
+  },
+  "homepage": "https://github.com/uday-sreenivasula/excel365-mcp",
+  "repository": "https://github.com/uday-sreenivasula/excel365-mcp",
+  "license": "MIT",
+  "keywords": ["excel", "sharepoint", "onedrive", "microsoft-graph", "mcp", "finance"]
+}

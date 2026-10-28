@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "excel365": {
+      "command": "cmd",
+      "args": ["/c", "${CLAUDE_PLUGIN_ROOT}\\launch.cmd"]
+    }
+  }
+}
