@@ -31,20 +31,20 @@ It's a Claude Code plugin with an MCP server (Model Context Protocol, the standa
 ## What Claude can do with it
 | Tool | Purpose |
 |---|---|
-| `xl_open` | Open a workbook by link or file name, and list its sheets (with `details`, also used ranges and formula counts) |
-| `xl_map` | A sheet's structure: copied formulas collapsed to one line, hardcoded numbers, labels, formulas with typed-in amounts |
-| `xl_read` | Read live cells (formula and value), several areas in one call |
-| `xl_find` | Search formulas/values, with total counts and per-sheet grouping |
-| `xl_trace` | What a cell is built from, including which rows a SUMIFS/XLOOKUP actually picks up, and what uses it |
-| `xl_write` / `xl_fill` | Edit cells with a conflict guard. Batches are all-or-nothing; `as_text` keeps date-like text as text; `watch` returns recalculated totals |
-| `xl_undo` / `xl_log` | Undo this chat's edits; an audit trail with old values; per-call timings |
-| `xl_changes` | What anyone changed since a checkpoint |
-| `xl_check` | Where errors start (and how many cells each breaks), circular references, `#REF!` formulas, external links |
-| `xl_insert` / `xl_delete` / `xl_format` | Insert or delete cells, rows and columns; formatting across many areas at once |
-| `xl_sheet` / `xl_add_sheet` / `xl_delete_sheet` | Hide, unhide, rename, reorder, add and delete sheets |
-| `xl_api` | Direct access to the Microsoft Graph API for anything else: named ranges, tables, charts, protection, recalculation |
+| `xl_open` | Open a workbook by link or file name; lists sheets (`details` adds used range and formula count) |
+| `xl_map` | A sheet's structure: copied formulas collapsed to one line, hardcoded numbers, labels, typed-in amounts |
+| `xl_read` | Live cells, several areas per call; also displayed text and number formats |
+| `xl_find` / `xl_trace` | Search formulas and values; trace what a cell is built from (down to the TB rows a SUMIFS picks up) or what uses it |
+| `xl_write` / `xl_fill` | Edit cells with a conflict guard. A flat `{cell: value}` map is grouped into ranges for you; batches are all-or-nothing; `watch` returns recalculated totals |
+| `xl_undo` / `xl_log` | Undo this chat's edits; audit trail, call timings, and what anyone changed since a checkpoint |
+| `xl_check` | Where errors start (and how many cells each breaks), circular references, `#REF!` formulas, external links, named-range count |
+| `xl_format` | Number formats, font, fill, wrap, alignment, column width/autofit, borders, hide/unhide rows or columns; many areas with different formats in one call |
+| `xl_shift` | Insert or delete cells, rows or columns |
+| `xl_sheet` | List, add, delete, hide, unhide, rename, reorder and colour worksheets |
+| `xl_file` | Server-side copy of the workbook (e.g. next month's file), org-wide edit link, list your files, local snapshot for pandas/openpyxl, save now, full recalculation, and a guarded whole-file replace for changes Graph can't make |
+| `xl_api` | Direct access to the Microsoft Graph API for anything else |
 
-Each Claude chat opens its own workbook, and that chat remembers it, even after Claude restarts the connector. Tools never act on a workbook another chat opened. To work across two workbooks in one chat, add `workbook=<file name>` to any tool.
+Each Claude chat opens its own workbook with `xl_open`, and that chat remembers it, even after Claude restarts the connector. Tools never act on a workbook another chat opened. To work across two workbooks in one chat, add `workbook=<file name>` to any tool.
 
 ### Skip the permission prompts (optional)
 To let Claude use these tools without asking each time, add this to `%USERPROFILE%\.claude\settings.json` under `permissions.allow`:
@@ -55,6 +55,7 @@ To let Claude use these tools without asking each time, add this to `%USERPROFIL
 ## Requirements and troubleshooting
 - **Windows only.** Sign-in is stored encrypted for your Windows user (DPAPI) in `%USERPROFILE%\.xlgraph`.
 - **Desktop Excel users should keep AutoSave on.** Ask people who have the file open in desktop Excel to save with AutoSave on (or close it) before Claude inserts or deletes rows. Otherwise their copy may fail to merge.
+- **Not available through Microsoft Graph:** cell comments, freeze panes, conditional formats.
 - **Map, find, trace and check use a downloaded snapshot**, which can be a minute or two behind live edits. Reads and writes are always live.
 - **If the connection to Microsoft stops responding**, the connector stops after one timed-out call and says so, instead of hanging.
 - **Setup log:** `%LOCALAPPDATA%\excel365\setup.log`. To force setup to run again, delete `%LOCALAPPDATA%\excel365\ready-1`.

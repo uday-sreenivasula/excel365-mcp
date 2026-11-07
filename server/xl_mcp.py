@@ -4,13 +4,13 @@ Reads/writes cells in a co-authored OneDrive/SharePoint workbook while the team 
 Bulk analysis (map / find / trace / check / changes) runs on a read-only snapshot of the file;
 writes go cell-by-cell through the Graph workbook API, are conflict-guarded and logged for undo.
 
-Auth: browser sign-in (opens automatically on first use; device code as fallback) as the user, through
-Microsoft's own "Microsoft Graph Command Line Tools" app. Any Microsoft 365 work/school account can sign in;
-set EXCEL365_TENANT (e.g. contoso.com) to restrict sign-in to one organisation. The refresh token is
-DPAPI-encrypted in %USERPROFILE%\\.xlgraph\\refresh.dat. The password never passes through this server.
+Auth: browser sign-in (opens automatically on first use; device code as fallback) as the user,
+Microsoft's "Microsoft Graph Command Line Tools" app; any Microsoft 365 work/school account can sign in
+(set EXCEL365_TENANT, e.g. contoso.com, to restrict to one organisation). The refresh token is DPAPI-encrypted
+in %USERPROFILE%\\.xlgraph\\refresh.dat. The password never passes through this server.
 
 The MCP stdio protocol is implemented here on the standard library, so openpyxl is the only dependency
-(installed by setup.cmd into %LOCALAPPDATA%\\excel365\\lib).
+(installed by setup.ps1 into %LOCALAPPDATA%\\excel365\\lib).
 """
 import atexit
 import base64
@@ -52,7 +52,7 @@ from openpyxl.formula.tokenizer import Token, Tokenizer
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter, column_index_from_string, range_boundaries
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 
 TENANT = os.environ.get("EXCEL365_TENANT", "").strip() or "organizations"  # "organizations" = any work/school account
 CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Microsoft Graph Command Line Tools
@@ -508,8 +508,20 @@ def _snapshot(force=False):
     if not os.path.exists(os.path.join(d, "baseline.xlsx")):
         shutil.copy(latest, os.path.join(d, "baseline.xlsx"))
     snap.clear()  # drop graphs cached for the previous version of the file
-    snap.update(ctag=meta["cTag"], f=_load_index(latest), loaded=time.time(), **info)
+    snap.update(ctag=meta["cTag"], f=_load_index(latest), names=_count_names(latest), loaded=time.time(), **info)
     return snap
+
+
+def _count_names(path):
+    """(workbook-level named ranges, how many point at #REF!) - thousands of stale names bloat a file."""
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, keep_links=False)
+        names = list(wb.defined_names.values())
+        broken = sum(1 for n in names if "#REF" in str(getattr(n, "attr_text", "")))
+        wb.close()
+        return len(names), broken
+    except Exception:
+        return 0, 0
 
 
 def _sheet_cells(sheet):
@@ -640,6 +652,24 @@ def _flat(m):
     return [_norm(x) for row in m for x in row]
 
 
+def _same_grid(a, b):
+    """Grids equal? Formulas as text ('=+A1' == '=A1'); constants as numbers within 1e-6 relative (Graph returns full
+    precision, e.g. 93716470.3500001, while the agent read 93716470.35)."""
+    fa, fb = _flat(a), _flat(b)
+    if len(fa) != len(fb):
+        return False
+    for x, y in zip(fa, fb):
+        if x == y:
+            continue
+        try:
+            if abs(float(x) - float(y)) <= 1e-6 * max(1.0, abs(float(x))):
+                continue
+        except ValueError:
+            pass
+        return False
+    return True
+
+
 def _shape(rng):
     c1, r1, c2, r2 = range_boundaries(rng)
     return r2 - r1 + 1, c2 - c1 + 1
@@ -647,7 +677,7 @@ def _shape(rng):
 
 def _do_write(sheet, rng, formulas, expect, note, cur=None):
     cur = cur or _live(sheet, rng)
-    if expect is not None and _flat(cur["formulas"]) != _flat(expect):
+    if expect is not None and not _same_grid(cur["formulas"], expect):
         return f"CONFLICT {_q(sheet)}!{rng}: now {cur['formulas']} (expected {expect}) - not written"
     res = _wb("PATCH", f"{_sheet_path(sheet)}/range(address='{rng}')", {"formulas": formulas})
     _log({"ts": dt.datetime.now().isoformat(timespec="seconds"), "item": _book()["item"], "sheet": sheet,
@@ -671,7 +701,7 @@ def _schema(tp):
     return {"type": _JSON_TYPES.get(origin or tp, "string")}
 
 
-_NO_WORKBOOK_PARAM = {"xl_login", "xl_status", "xl_open"}
+_NO_WORKBOOK_PARAM = {"xl_status", "xl_open"}
 
 
 class MiniMCP:
@@ -686,11 +716,10 @@ class MiniMCP:
                 props[p.name] = _schema(hints.get(p.name, str))
                 if p.default is inspect.Parameter.empty:
                     required.append(p.name)
-                else:
+                elif p.default not in ("", False, None, -1):  # the required list already says what is optional
                     props[p.name]["default"] = p.default
             if fn.__name__ not in _NO_WORKBOOK_PARAM:
-                props["workbook"] = {"type": "string", "description": "Optional: file name (or part of it) of the workbook "
-                                     "to act on; switches this chat to it first. Lets one chat work across several workbooks."}
+                props["workbook"] = {"type": "string"}  # explained once in the server instructions
             self.tools[fn.__name__] = (fn, {"name": fn.__name__, "description": inspect.cleandoc(fn.__doc__ or ""),
                                             "inputSchema": {"type": "object", "properties": props, "required": required}})
             return fn
@@ -827,32 +856,19 @@ def _start_sign_in(reason):
 mcp = MiniMCP(
     name="excel365",
     instructions=(
-        "Live Excel 365 connector for co-authored OneDrive/SharePoint workbooks (the team may be editing at the same time). "
-        "Workflow: xl_open(link or file name) once per chat (it is remembered for this chat, also across restarts) -> "
-        "xl_map(sheet) BEFORE bulk reads of an unfamiliar sheet (collapsed formula patterns, hardcodes, typed-in amounts) -> "
-        "xl_read for exact live cells (several areas in one call: \"'BS'!C21:C65,'S-CFS'!C8:E65\") -> xl_write / xl_fill "
-        "for targeted edits (pass expect= the formulas you read so a teammate's newer edit is never overwritten; batches "
-        "are all-or-nothing; add watch= to get recalculated totals back in the same call instead of extra reads) -> "
-        "xl_check (error ORIGINS + circular references). xl_find/xl_trace answer 'where is X used' and 'which TB rows "
-        "feed this SUMIFS'. Work across two workbooks in one chat with workbook=<file name> on any tool. "
-        "xl_changes shows what the team changed since the last baseline. xl_undo reverts this chat's own writes. "
-        "Addresses always use Sheet!A1 form; quote sheet names with spaces: 'BS Notes'!C5. "
-        "Text that looks like a date ('March 31, 2026') becomes a date number unless written with as_text=true. "
-        "If totals don't reconcile after a write and calculation is Automatic, run xl_check: suspect a circular reference. "
-        "Before structural edits (insert/delete rows, rebuilding a block) ask whether anyone has the file open in DESKTOP "
-        "Excel; they should save with AutoSave on or close it first, else their copy may fail to merge. "
-        "If a tool says the connection to Microsoft 365 is not responding, stop and tell the user to check the PC's "
-        "internet/VPN - do not keep retrying. "
-        "Snapshot-based tools (map/find/trace/check) reflect the last autosaved state, up to a minute or two behind live. "
-        "If a tool says a sign-in page opened, tell the user to sign in in their browser, then retry. "
-        "Never ask the user for their password."),
+        "Live Excel 365 (OneDrive/SharePoint) workbooks that a team co-edits. Per chat: xl_open once (remembered across "
+        "restarts; workbook= on any tool switches). Unfamiliar sheet: xl_map before bulk xl_read. Edit with xl_write/xl_fill "
+        "and expect= (a teammate's newer edit is never overwritten; batches are all-or-nothing; watch= returns recalculated "
+        "cells in the same call). xl_check = error origins + circular references (suspect a loop when totals don't reconcile). "
+        "Addresses: Sheet!A1; quote names with spaces: 'BS Notes'!C5. Date-like text needs as_text. map/find/trace/check use "
+        "a snapshot up to ~2 min behind live. Never download-edit-upload by hand: xl_file replace is the guarded way. "
+        "Before inserting/deleting rows ask whether anyone has the file open in desktop Excel (save with AutoSave on, or "
+        "close). On 'connection not responding': stop, tell the user to check internet/VPN. On 'sign-in page opened': the "
+        "user signs in in their browser, then retry; never ask for a password."),
 )
 
 
-@mcp.tool()
-def xl_login(method: str = "browser") -> str:
-    """Sign in to Microsoft 365 (also happens automatically on first use). method: browser (opens the Microsoft
-    sign-in page) | code (device code, for when no browser opens on this machine). Check progress with xl_status."""
+def _do_login(method):
     if method == "browser":
         url = _browser_login()
         return f"Microsoft sign-in opened in the user's browser. If it did not appear, they can open: {url}"
@@ -880,8 +896,11 @@ def xl_login(method: str = "browser") -> str:
 
 
 @mcp.tool()
-def xl_status() -> str:
-    """Sign-in state and the currently open workbook."""
+def xl_status(login: str = "") -> str:
+    """Sign-in state, this chat's workbook, version. login='browser' opens Microsoft's sign-in page (normally automatic);
+    'code' = device code when no browser can open here."""
+    if login:
+        return _do_login(login)
     try:
         _token()
         auth = "signed in"
@@ -913,12 +932,22 @@ def _search_books(text):
     return hits
 
 
+def _open_item(target):
+    """Make target this chat's workbook (and remember it); returns its file metadata."""
+    s = _state()
+    meta = _graph("GET", f"/drives/{target['drive']}/items/{target['item']}?$select=name,size,lastModifiedDateTime,lastModifiedBy")
+    target["name"] = meta["name"]  # files get renamed; keep the current name
+    s["books"][target["item"]] = target
+    s["current"] = target["item"]
+    _save_state(s)
+    _set_current(target["item"])
+    return meta
+
+
 @mcp.tool()
 def xl_open(link_or_name: str, details: bool = False) -> str:
-    """Open a workbook by SharePoint/OneDrive link (sharing link or the browser address-bar URL) or by file name
-    (searches everything the user can access; a name opened before is matched first). Lists sheets and visibility -
-    fast, no download. details=True also downloads a snapshot to show used ranges and formula counts per sheet.
-    If several files match a name, returns the candidates - call again with the exact name."""
+    """Open a workbook by link or file name (own and shared files; a partial name is enough). Lists sheets.
+    details=True adds used range and formula count per sheet (downloads a snapshot)."""
     s = _state()
     target = None
     if link_or_name.startswith("http"):
@@ -955,12 +984,7 @@ def xl_open(link_or_name: str, details: bool = False) -> str:
             else:
                 return "Several files match - call xl_open again with the exact name:\n" + "\n".join(
                     f"  {h['name']}  (modified {h['modified']})  {h['url']}" for h in hits)
-    meta = _graph("GET", f"/drives/{target['drive']}/items/{target['item']}?$select=name,size,lastModifiedDateTime,lastModifiedBy")
-    target["name"] = meta["name"]  # files get renamed; keep the current name
-    s["books"][target["item"]] = target
-    s["current"] = target["item"]
-    _save_state(s)
-    _set_current(target["item"])
+    meta = _open_item(target)
     b = _book()
     sheets = _wb("GET", "/worksheets?$select=name,position,visibility")["value"]
     lines = [f"{b['name']}  ({meta['size'] // 1024} KB, last saved {meta['lastModifiedDateTime']} by "
@@ -979,8 +1003,8 @@ def xl_open(link_or_name: str, details: bool = False) -> str:
 
 @mcp.tool()
 def xl_read(address: str, mode: str = "both") -> str:
-    """LIVE read of one or many areas in ONE call, e.g. "'BS Notes'!B5:H40" or "'MB5B Costing'!A306:AN306,A309:AN309,Summary!E20".
-    mode: both | formulas | values. Blank cells are skipped. Output: one line per cell 'A1 | formula | value'."""
+    """Live cells, several areas per call: "'BS Notes'!B5:H40,Summary!E20". mode: both | formulas | values |
+    text (as displayed) | format (number formats). Blank cells skipped; lines 'A1 | formula | value'."""
     blocks = []
     for sheet, rng in _areas(address):
         c1, r1, c2, r2 = range_boundaries(rng)
@@ -988,6 +1012,15 @@ def xl_read(address: str, mode: str = "both") -> str:
         for rs in range(r1, r2 + 1, step):
             re_ = min(r2, rs + step - 1)
             sub = f"{get_column_letter(c1)}{rs}:{get_column_letter(c2)}{re_}"
+            if mode in ("text", "format"):
+                d = _live(sheet, sub, select="address,values,text,numberFormat")
+                grid = d["text"] if mode == "text" else d["numberFormat"]
+                for i, row in enumerate(grid):
+                    for j, t in enumerate(row):
+                        if d["values"][i][j] == "" and (mode == "text" or t == "General"):
+                            continue
+                        out.append(f"{get_column_letter(c1 + j)}{rs + i} | {t}")
+                continue
             d = _live(sheet, sub)
             for i, (frow, vrow) in enumerate(zip(d["formulas"], d["values"])):
                 for j, (f, v) in enumerate(zip(frow, vrow)):
@@ -1027,10 +1060,8 @@ def _typed_numbers(formula):
 
 @mcp.tool()
 def xl_map(sheet: str, address: str = "", labels: bool = True) -> str:
-    """Structural map of a sheet from the snapshot - the best first call on an unfamiliar sheet, before bulk xl_read.
-    Formula blocks grouped by relative pattern (copies collapse to one line, with the first value), hardcoded number
-    blocks, text labels, and formulas with typed-in amounts flagged (e.g. =ROUND(840332/10^5,2)).
-    Optional address limits it, e.g. 'A1:H80'."""
+    """Snapshot structure of a sheet: formula blocks collapsed by pattern, hardcoded numbers, labels, typed-in amounts
+    flagged. Use before bulk reads of an unfamiliar sheet. address limits it, e.g. A1:H80."""
     sheet, cells = _sheet_cells(sheet)
     if address:
         c1, r1, c2, r2 = range_boundaries(_split(address, sheet)[1])
@@ -1108,10 +1139,8 @@ def _sheet_filter(idx, sheets, sheets_exclude, visible_only):
 @mcp.tool()
 def xl_find(text: str, regex: bool = False, where: str = "both", sheets: str = "", limit: int = 300,
             sheets_exclude: str = "", visible_only: bool = False, group_by: str = "") -> str:
-    """Search formulas and/or values across the workbook (snapshot). where: formulas | values | both.
-    sheets / sheets_exclude: comma lists; visible_only skips hidden sheets. Always reports the TOTAL match count, even
-    past limit. group_by="sheet" returns match counts per sheet instead of cells (good first pass on big searches).
-    Example: every formula pointing at TB column G -> text="TB!$G", where="formulas"."""
+    """Search formulas/values (snapshot). where: formulas | values | both. sheets / sheets_exclude: comma lists.
+    group_by='sheet' -> counts per sheet. Always reports the total match count."""
     idx = _snapshot()["f"]
     pat = re.compile(text if regex else re.escape(text), re.I)
     out, total, per = [], 0, {}
@@ -1258,9 +1287,8 @@ def _resolve_lookups(formula, own_sheet, idx, max_rows=12):
 
 @mcp.tool()
 def xl_trace(address: str, direction: str = "precedents", depth: int = 2) -> str:
-    """Trace a cell. precedents = what it is built from (recursing into small ranges; for SUMIFS/SUMIF/COUNTIFS/XLOOKUP/
-    VLOOKUP over whole columns it shows WHICH rows match and their values, e.g. the TB rows behind a note line);
-    dependents = which formulas use it. Example: xl_trace("BS!C8", "precedents", 3)."""
+    """precedents: what a cell is built from (SUMIFS/SUMIF/COUNTIFS/XLOOKUP/VLOOKUP over columns resolved to the
+    matching rows and values); dependents: formulas that use it."""
     snap = _snapshot()
     idx = snap["f"]
     sheet, rng = _split(address)
@@ -1330,17 +1358,40 @@ def _watch(watch):
         return f"\n--- watch failed: {e}"
 
 
+def _runs(cells):
+    """{"'Sheet'!C5": v, ...} -> edits of contiguous vertical runs per sheet and column."""
+    by = {}
+    for addr, v in cells.items():
+        sheet, ref = _split(addr)
+        m = re.fullmatch(r"([A-Za-z]{1,3})(\d+)", ref)
+        if not m:
+            raise ValueError(f"cells: '{addr}' must be a single cell like Sheet!C5")
+        by.setdefault((sheet, m[1].upper()), []).append((int(m[2]), v))
+    edits = []
+    for (sheet, col), items in by.items():
+        items.sort()
+        run = [items[0]]
+        for it in items[1:] + [None]:
+            if it and it[0] == run[-1][0] + 1:
+                run.append(it)
+                continue
+            edits.append({"address": f"{_q(sheet)}!{col}{run[0][0]}:{col}{run[-1][0]}", "formulas": [[v] for _, v in run]})
+            if it:
+                run = [it]
+    return edits
+
+
 @mcp.tool()
 @_commits
-def xl_write(edits: list[dict], note: str = "", atomic: bool = True, as_text: bool = False, watch: str = "") -> str:
-    """LIVE write. edits: [{"address": "'BS Notes'!F12", "formulas": [["=SUM(F5:F11)"]], "expect": [["=SUM(F5:F10)"]]}].
-    'formulas' is a 2D array matching the range (constants allowed; "" clears). Shorthand "formula": "=..." for one cell.
-    'expect' (optional, recommended) = formulas you last read; if the live cell differs (teammate edited), that edit is
-    skipped ('=+A1' and '=A1' count as equal). atomic=True (default): every expect is checked BEFORE anything is written;
-    one conflict -> nothing is written. as_text=True (or "text": true on one edit): literal strings stay text - use for
-    headings like "March 31, 2026" that Excel would otherwise turn into a date number.
-    watch: areas to read back after writing, e.g. "BS!C65,'S-CFS'!E65" - returns their recalculated values in this response.
-    Every write is logged with old formulas for xl_undo. note = short reason for the audit log."""
+def xl_write(edits: list[dict] | None = None, cells: dict | None = None, note: str = "", atomic: bool = True,
+             as_text: bool = False, watch: str = "") -> str:
+    """Live write. edits: [{address, formulas (2D grid; "" clears) or formula (one cell), expect (grid you last read;
+    a changed cell is not overwritten), text (keep strings as text)}]. cells: {"'Sheet'!C5": value, ...} flat map,
+    grouped into runs for you. atomic: one conflict -> nothing written. as_text: all strings stay text (dates!).
+    watch: areas read back after writing. note: audit reason. Undo with xl_undo."""
+    edits = list(edits or []) + (_runs(cells) if cells else [])
+    if not edits:
+        return "nothing to write: give edits or cells"
     plan, res = [], []
     for e in edits:
         sheet, rng = _split(e["address"])
@@ -1365,7 +1416,7 @@ def xl_write(edits: list[dict], note: str = "", atomic: bool = True, as_text: bo
         conflicts = []
         for addr, sheet, rng, f, exp in plan:
             cur[addr] = _live(sheet, rng)
-            if exp is not None and _flat(cur[addr]["formulas"]) != _flat(exp):
+            if exp is not None and not _same_grid(cur[addr]["formulas"], exp):
                 conflicts.append(f"CONFLICT {_q(sheet)}!{rng}: now {cur[addr]['formulas']} (expected {exp})")
         if conflicts:
             return "\n".join(conflicts) + f"\nNOTHING WRITTEN (atomic): {len(conflicts)} of {len(plan)} edits conflict. " \
@@ -1383,9 +1434,8 @@ def xl_write(edits: list[dict], note: str = "", atomic: bool = True, as_text: bo
 @mcp.tool()
 @_commits
 def xl_fill(address: str, formula: str, expect_blank: bool = False, note: str = "", watch: str = "") -> str:
-    """LIVE: write one formula, written as for the TOP-LEFT cell, across the whole range with relative refs adjusting
-    (like Excel fill-down/right). Example: xl_fill("BS!C8:C40", "=ROUND(+R8/100000,2)").
-    expect_blank=True refuses if any target cell already has content. watch: areas to read back after writing."""
+    """One formula, written as for the top-left cell, filled across the range with relative refs adjusting.
+    expect_blank refuses if any target cell has content. watch: areas read back after writing."""
     sheet, rng = _split(address)
     c1, r1, c2, r2 = range_boundaries(rng)
     origin = f"{get_column_letter(c1)}{r1}"
@@ -1400,8 +1450,7 @@ def xl_fill(address: str, formula: str, expect_blank: bool = False, note: str = 
 @mcp.tool()
 @_commits
 def xl_undo(count: int = 1, any_chat: bool = False) -> str:
-    """Revert Claude's last `count` writes on the current workbook made in THIS chat (most recent first).
-    any_chat=True also includes writes made from the user's other Claude chats. Skips a write if someone changed those cells since."""
+    """Revert this chat's last writes (newest first; any_chat includes other chats). Cells changed since are skipped."""
     if not os.path.exists(_LOG):
         return "nothing to undo"
     lines = open(_LOG, encoding="utf-8").read().splitlines()
@@ -1414,7 +1463,7 @@ def xl_undo(count: int = 1, any_chat: bool = False) -> str:
     for i in picked:
         e = json.loads(lines[i])
         cur = _live(e["sheet"], e["range"])["formulas"]
-        if _flat(cur) != _flat(e["new"]):
+        if not _same_grid(cur, e["new"]):
             res.append(f"SKIP {_q(e['sheet'])}!{e['range']}: changed since Claude wrote it (now {cur})")
             continue
         _wb("PATCH", f"{_sheet_path(e['sheet'])}/range(address='{e['range']}')", {"formulas": e["old"]})
@@ -1426,12 +1475,13 @@ def xl_undo(count: int = 1, any_chat: bool = False) -> str:
 
 
 @mcp.tool()
-def xl_log(limit: int = 20, this_chat_only: bool = False, include_reads: bool = False) -> str:
-    """Claude's recent writes to the current workbook (audit trail), each tagged [this chat] or [other chat].
-    this_chat_only=True hides other chats' writes. include_reads=True instead lists recent tool calls of every kind
-    with their duration in ms (timing telemetry), plus averages per tool."""
+def xl_log(what: str = "writes", limit: int = 20, this_chat_only: bool = False, reset_baseline: bool = False) -> str:
+    """what: writes = audit trail of edits ([this chat]/[other chat]) | calls = tool-call timings | changes = cells
+    anyone changed since the baseline snapshot (reset_baseline makes now the baseline)."""
+    if what == "changes":
+        return _changes(reset_baseline)
     item = _book()["item"]
-    if include_reads:
+    if what == "calls":
         if not os.path.exists(_CALLS):
             return "no calls logged yet"
         rows = [json.loads(x) for x in open(_CALLS, encoding="utf-8").read().splitlines()[-5000:] if x.strip()]
@@ -1454,10 +1504,7 @@ def xl_log(limit: int = 20, this_chat_only: bool = False, include_reads: bool = 
                      for r in rows) or "no writes yet"
 
 
-@mcp.tool()
-def xl_changes(include_values: bool = False, reset_baseline: bool = False) -> str:
-    """What changed in the workbook since the baseline snapshot (by anyone): formulas/inputs changed, added, removed.
-    include_values also lists recalculated values (noisy). reset_baseline=True makes the current state the new baseline afterwards."""
+def _changes(reset_baseline, include_values=False):
     snap = _snapshot(force=True)
     d = _snap_dir()
     base = _load_index(os.path.join(d, "baseline.xlsx"))
@@ -1599,11 +1646,8 @@ def _cycles(idx, refs_idx, max_cycles=10):
 
 @mcp.tool()
 def xl_check(sheets: str = "", visible_only: bool = False, limit: int = 40, cycles: bool = True) -> str:
-    """Health scan (snapshot). 1) ERROR ORIGINS: of all #REF!/#N/A/#DIV/0!... cells, only the ones where an error STARTS,
-    each with how many downstream cells it breaks (fix these; the rest clear themselves). 2) CIRCULAR REFERENCES
-    (Graph/Excel Online do not report them): if totals don't reconcile after a write and calculation is Automatic,
-    suspect these. 3) Formulas containing #REF! and external-workbook links.
-    sheets: comma list to limit origins/links to those sheets; visible_only skips hidden sheets; limit caps each list."""
+    """Snapshot health: error ORIGINS (cells where an error starts, with how many cells each breaks - fix those),
+    circular references, formulas containing #REF!, external links, named ranges. sheets: comma list; limit per list."""
     snap = _snapshot()
     idx = snap["f"]
     refs_idx = _refs_index(snap)
@@ -1633,109 +1677,174 @@ def xl_check(sheets: str = "", visible_only: bool = False, limit: int = 40, cycl
             if re.search(r"\[\d+\]|\.xls[xmb]?\]", re.sub(r'"[^"]*"', "", f), re.I):
                 ext.append(f"  {a} | {f}")
     out += [f"FORMULAS CONTAINING #REF!: {len(refs)}", *refs[:limit], f"EXTERNAL LINKS: {len(ext)}", *ext[:limit]]
+    n_names, n_broken = snap.get("names", (0, 0))
+    out.append(f"NAMED RANGES: {n_names}" + (f" ({n_broken} broken with #REF!)" if n_broken else "")
+               + ("  - thousands of names bloat a file; only xl_file replace can remove them in bulk" if n_names > 500 else ""))
     return _clip("\n".join(out))
 
 
+_WHOLE_COL = re.compile(r"[A-Za-z]{1,3}(:[A-Za-z]{1,3})?")
+_WHOLE_ROW = re.compile(r"\d+(:\d+)?")
+
+
 @mcp.tool()
 @_commits
-def xl_insert(address: str, shift: str = "Down", note: str = "") -> str:
-    """LIVE: insert blank cells/rows/columns at address, shifting existing cells. shift: Down | Right. Whole rows: 'BS Notes'!12:14.
-    Structural change: if the user or a teammate has this workbook open in DESKTOP Excel, ask them first to save and
-    turn AutoSave on (or close it) - inserting rows under their open copy is the classic cause of "your changes could
-    not be merged" in desktop Excel. The change is saved to the file right away."""
+def xl_shift(address: str, action: str = "insert", shift: str = "", note: str = "") -> str:
+    """Insert or delete cells: rows 'BS Notes'!12:14, columns Sheet!B:C, or a cell range. action: insert | delete
+    (delete is not undoable: confirm first). shift: Down|Right / Up|Left, automatic for whole rows/columns.
+    Saved at once; ask first if anyone has the file open in desktop Excel."""
     sheet, rng = _split(address)
-    r = _wb("POST", f"{_sheet_path(sheet)}/range(address='{rng}')/insert", {"shift": shift})
+    ins = action.lower().startswith("ins")
+    if not shift:
+        shift = ("Right" if ins else "Left") if _WHOLE_COL.fullmatch(rng) else ("Down" if ins else "Up")
+    _wb("POST", f"{_sheet_path(sheet)}/range(address='{rng}')/{'insert' if ins else 'delete'}", {"shift": shift.capitalize()})
     _log({"ts": dt.datetime.now().isoformat(timespec="seconds"), "item": _book()["item"], "sheet": sheet, "range": rng,
-          "old": None, "new": f"INSERT {shift}", "note": note, "undone": "n/a (structural)"})
+          "old": None, "new": f"{'INSERT' if ins else 'DELETE'} {shift}", "note": note, "undone": "n/a (structural)"})
     _close_session(_book()["item"], _book()["drive"])  # save now: co-authors should see the new layout at once
-    return f"inserted {_q(sheet)}!{r.get('address', rng)} shift {shift}"
+    return f"{'inserted' if ins else 'deleted'} {_q(sheet)}!{rng} shift {shift}"
+
+
+_H = {"left": "Left", "center": "Center", "centre": "Center", "right": "Right", "general": "General"}
+_V = {"top": "Top", "center": "Center", "centre": "Center", "middle": "Center", "bottom": "Bottom"}
+_EDGES = {"all": ["EdgeTop", "EdgeBottom", "EdgeLeft", "EdgeRight", "InsideHorizontal", "InsideVertical"],
+          "outline": ["EdgeTop", "EdgeBottom", "EdgeLeft", "EdgeRight"], "top": ["EdgeTop"], "bottom": ["EdgeBottom"],
+          "left": ["EdgeLeft"], "right": ["EdgeRight"]}
+_EDGES["none"] = _EDGES["all"]
+
+
+def _format_one(sheet, rng, props):
+    p = f"{_sheet_path(sheet)}/range(address='{rng}')"
+    done = []
+    whole_col, whole_row = _WHOLE_COL.fullmatch(rng), _WHOLE_ROW.fullmatch(rng)
+    nf = props.get("number_format")
+    if nf:
+        if whole_col or whole_row:
+            raise ValueError("number_format needs explicit rows and columns (e.g. A2:A700), not whole columns/rows")
+        rows, cols = _shape(rng)
+        if rows * cols > 250000:
+            raise ValueError("number_format area over 250k cells: split it")
+        _wb("PATCH", p, {"numberFormat": [[nf] * cols for _ in range(rows)]}); done.append("number_format")
+    font = {k2: props[k] for k, k2 in (("bold", "bold"), ("italic", "italic"), ("size", "size"), ("font_color", "color"))
+            if props.get(k) is not None}
+    if font:
+        _wb("PATCH", p + "/format/font", font); done.append("font")
+    fill = props.get("fill")
+    if fill:
+        if str(fill).lower() in ("none", "clear"):
+            _wb("POST", p + "/format/fill/clear"); done.append("fill cleared")
+        else:
+            _wb("PATCH", p + "/format/fill", {"color": fill}); done.append("fill")
+    body = {}
+    if props.get("wrap") is not None:
+        body["wrapText"] = bool(props["wrap"])
+    if props.get("align"):
+        body["horizontalAlignment"] = _H.get(str(props["align"]).lower(), str(props["align"]).capitalize())
+    if props.get("valign"):
+        body["verticalAlignment"] = _V.get(str(props["valign"]).lower(), str(props["valign"]).capitalize())
+    w = props.get("width")
+    if w not in (None, "", "auto"):
+        body["columnWidth"] = float(w)
+    if body:
+        _wb("PATCH", p + "/format", body); done.append("layout")
+    if w == "auto":
+        _wb("POST", p + "/format/autofitColumns"); done.append("autofit")
+    if props.get("hidden") is not None:
+        hidden = bool(props["hidden"])
+        if whole_col:
+            a, b = rng.split(":")[0], rng.split(":")[-1]
+            c1, c2, r1, r2 = column_index_from_string(a.upper()), column_index_from_string(b.upper()), 1, 1
+        elif whole_row:
+            a, b = rng.split(":")[0], rng.split(":")[-1]
+            r1, r2, c1, c2 = int(a), int(b), 1, 1
+        else:
+            c1, r1, c2, r2 = range_boundaries(rng)
+        if whole_col or (not whole_row and r1 == r2):
+            # columns: a row-1 address answers in 0.3 s; a whole-column address takes ~50 s on Graph
+            _wb("PATCH", f"{_sheet_path(sheet)}/range(address='{get_column_letter(c1)}1:{get_column_letter(c2)}1')", {"columnHidden": hidden})
+            done.append(("hid" if hidden else "unhid") + " columns")
+        else:
+            _wb("PATCH", f"{_sheet_path(sheet)}/range(address='A{r1}:A{r2}')", {"rowHidden": hidden})
+            done.append(("hid" if hidden else "unhid") + " rows")
+    border = props.get("border")
+    if border:
+        edges = _EDGES.get(str(border).lower())
+        if not edges:
+            raise ValueError("border must be all | outline | top | bottom | left | right | none")
+        style = {"style": "None"} if str(border).lower() == "none" else {"style": "Continuous", "color": props.get("border_color", "#000000")}
+        for e in edges:
+            _wb("PATCH", f"{p}/format/borders/{e}", style)
+        done.append(f"border {border}")
+    return done
 
 
 @mcp.tool()
 @_commits
-def xl_delete(address: str, shift: str = "Up", note: str = "") -> str:
-    """LIVE: delete cells/rows/columns, shifting the rest. shift: Up | Left. Not undoable via xl_undo - confirm with the user first.
-    Structural change: same desktop-Excel caution as xl_insert (ask users with it open in desktop Excel to save with
-    AutoSave on, or close it, first). The change is saved to the file right away."""
-    sheet, rng = _split(address)
-    _wb("POST", f"{_sheet_path(sheet)}/range(address='{rng}')/delete", {"shift": shift})
-    _log({"ts": dt.datetime.now().isoformat(timespec="seconds"), "item": _book()["item"], "sheet": sheet, "range": rng,
-          "old": None, "new": f"DELETE {shift}", "note": note, "undone": "n/a (structural)"})
-    _close_session(_book()["item"], _book()["drive"])  # save now: co-authors should see the new layout at once
-    return f"deleted {_q(sheet)}!{rng} shift {shift}"
-
-
-@mcp.tool()
-@_commits
-def xl_format(address: str, number_format: str = "", bold: bool | None = None, fill: str = "", font_color: str = "") -> str:
-    """LIVE: format one or many areas in ONE call: "'MB5B Costing'!A306:AN306,A309:AN309,A312:AN312" (areas without a
-    sheet use the previous one). number_format e.g. '#,##0.00;(#,##0.00)'; fill/font_color as '#RRGGBB'; bold true/false."""
+def xl_format(address: str = "", props: dict | None = None, specs: list[dict] | None = None) -> str:
+    """Format live cells. address: one or many areas ("Sheet!A1:B2,C4:D9"). props keys: number_format, bold, italic,
+    size, font_color, fill ('#RRGGBB' or 'none'), wrap, align (left|center|right), valign (top|center|bottom), width
+    (points or 'auto'), hidden (true/false: the area's columns, or rows for a column range), border (all|outline|top|
+    bottom|left|right|none). specs: [{address, ...props}] for many areas with different props in one call."""
+    jobs = [(address, props or {})] if address else []
+    for s in specs or []:
+        s = dict(s)
+        jobs.append((s.pop("address", ""), s))
     res = []
-    for sheet, rng in _areas(address):
-        p = f"{_sheet_path(sheet)}/range(address='{rng}')"
-        done = []
-        try:
-            if number_format:
-                rows, cols = _shape(rng)
-                _wb("PATCH", p, {"numberFormat": [[number_format] * cols for _ in range(rows)]}); done.append("numberFormat")
-            if bold is not None or font_color:
-                body = {}
-                if bold is not None:
-                    body["bold"] = bold
-                if font_color:
-                    body["color"] = font_color
-                _wb("PATCH", p + "/format/font", body); done.append("font")
-            if fill:
-                _wb("PATCH", p + "/format/fill", {"color": fill}); done.append("fill")
-            res.append(f"formatted {_q(sheet)}!{rng}: {', '.join(done) or 'nothing'}")
-        except GraphError as e:
-            res.append(f"FAILED {_q(sheet)}!{rng}: {str(e)[:200]}")
-    return "\n".join(res)
+    for addr, pr in jobs:
+        if not addr:
+            res.append("SKIPPED spec without address")
+            continue
+        for sheet, rng in _areas(addr):
+            try:
+                done = _format_one(sheet, rng, pr)
+                res.append(f"formatted {_q(sheet)}!{rng}: {', '.join(done) or 'nothing (no props given)'}")
+            except (GraphError, ValueError) as e:
+                res.append(f"FAILED {_q(sheet)}!{rng}: {str(e)[:200]}")
+    return "\n".join(res) or "nothing to format: give address + props, or specs"
+
+
+_VIS = {"hide": "Hidden", "unhide": "Visible", "show": "Visible", "veryhide": "VeryHidden"}
 
 
 @mcp.tool()
 @_commits
-def xl_add_sheet(name: str) -> str:
-    """LIVE: add a new worksheet."""
-    r = _wb("POST", "/worksheets/add", {"name": name})
-    return f"added sheet {r.get('name')} at position {r.get('position')}"
-
-
-_VIS = {"visible": "Visible", "show": "Visible", "unhide": "Visible", "hidden": "Hidden", "hide": "Hidden",
-        "veryhidden": "VeryHidden", "very_hidden": "VeryHidden"}
-
-
-@mcp.tool()
-@_commits
-def xl_sheet(names: str, visibility: str = "", new_name: str = "", position: int = -1, tab_color: str = "") -> str:
-    """LIVE: change worksheets. names: one sheet, a comma list, or "*" for every sheet.
-    visibility: visible | hidden | veryhidden (hide/unhide). new_name: rename (single sheet). position: 0-based tab order.
-    tab_color: '#RRGGBB' ('' leaves it). Example: unhide all -> xl_sheet("*", visibility="visible")."""
+def xl_sheet(names: str = "", action: str = "list", new_name: str = "", position: int = -1, color: str = "") -> str:
+    """Worksheets. action: list | hide | unhide | veryhide | add | delete | rename | move | color. names: one sheet, a
+    comma list, or * for all (add: the new name). rename/move take one sheet (new_name / 0-based position);
+    color '#RRGGBB'. delete is not undoable: confirm first."""
+    act = action.lower().strip() or "list"
     sheets = _wb("GET", "/worksheets?$select=name,visibility,position")["value"]
+    if act == "list":
+        return "\n".join(f"{s['position']:>3} {s['name']!r:<34} {s['visibility']}" for s in sheets)
+    if act == "add":
+        r = _wb("POST", "/worksheets/add", {"name": names} if names.strip() else {})
+        return f"added sheet {r.get('name')!r} at position {r.get('position')}"
     if names.strip() == "*":
         targets = [s["name"] for s in sheets]
     else:
         wanted = [n.strip() for n in names.split(",") if n.strip()]
         by_lower = {s["name"].strip().lower(): s["name"] for s in sheets}
-        missing = [n for n in wanted if n.strip().lower() not in by_lower]
-        if missing:
-            return f"No sheet(s) {missing}. Sheets: {', '.join(s['name'] for s in sheets)}"
-        targets = [by_lower[n.strip().lower()] for n in wanted]
-    body = {}
-    if visibility:
-        if visibility.lower() not in _VIS:
-            return "visibility must be visible | hidden | veryhidden"
-        body["visibility"] = _VIS[visibility.lower()]
-    if tab_color:
-        body["tabColor"] = tab_color
-    if (new_name or position >= 0) and len(targets) != 1:
-        return "new_name / position need exactly one sheet"
-    if new_name:
-        body["name"] = new_name
-    if position >= 0:
-        body["position"] = position
-    if not body:
-        return "\n".join(f"{s['position']:>3} {s['name']!r:<34} {s['visibility']}" for s in sheets)
+        missing = [n for n in wanted if n.lower() not in by_lower]
+        if missing or not wanted:
+            return f"No sheet(s) {missing or '(none given)'}. Sheets: {', '.join(s['name'] for s in sheets)}"
+        targets = [by_lower[n.lower()] for n in wanted]
+    if act == "delete":
+        for t in targets:
+            _wb("DELETE", _sheet_path(t))
+        _log({"ts": dt.datetime.now().isoformat(timespec="seconds"), "item": _book()["item"], "sheet": ",".join(targets),
+              "range": "", "old": None, "new": "DELETE SHEET", "note": ""})
+        return "deleted sheet(s): " + ", ".join(repr(t) for t in targets)
+    if act in _VIS:
+        body = {"visibility": _VIS[act]}
+    elif act == "rename":
+        body = {"name": new_name}
+    elif act == "move":
+        body = {"position": position}
+    elif act == "color":
+        body = {"tabColor": color}
+    else:
+        return "action must be list | hide | unhide | veryhide | add | delete | rename | move | color"
+    if act in ("rename", "move") and len(targets) != 1:
+        return f"{act} needs exactly one sheet"
     out = []
     for t in targets:
         try:
@@ -1748,24 +1857,112 @@ def xl_sheet(names: str, visibility: str = "", new_name: str = "", position: int
     return "\n".join(out)
 
 
+def _upload(drive, item, data):
+    """Replace a file's content through an upload session, 10 MiB chunks (a multiple of the 320 KiB Graph requires)."""
+    up = _graph("POST", f"/drives/{drive}/items/{item}/createUploadSession", {"item": {"@microsoft.graph.conflictBehavior": "replace"}})
+    url, total, pos, body = up["uploadUrl"], len(data), 0, b""
+    while pos < total:
+        chunk = data[pos:pos + 10 * 1024 * 1024]
+        req = urllib.request.Request(url, data=chunk, method="PUT", headers={
+            "Content-Length": str(len(chunk)), "Content-Range": f"bytes {pos}-{pos + len(chunk) - 1}/{total}"})
+        with urllib.request.urlopen(req, timeout=300) as r:
+            body = r.read()
+        pos += len(chunk)
+    return json.loads(body) if body else {}
+
+
 @mcp.tool()
-@_commits
-def xl_delete_sheet(name: str) -> str:
-    """LIVE: permanently delete a worksheet (not undoable via xl_undo) - confirm with the user first."""
-    _wb("DELETE", _sheet_path(name))
-    _log({"ts": dt.datetime.now().isoformat(timespec="seconds"), "item": _book()["item"], "sheet": name,
-          "range": "", "old": None, "new": "DELETE SHEET", "note": ""})
-    return f"deleted sheet {name!r}"
+def xl_file(action: str, name: str = "", path: str = "") -> str:
+    """File-level actions. copy: server-side copy of the open workbook as `name`, then opens it | link: org-wide edit
+    link | list: your Excel files (matching `name`) | snapshot: local path of an up-to-date read-only copy for
+    openpyxl/pandas | save: flush pending edits now | calc: full recalculation | replace: upload the local file at
+    `path` over the open workbook, only for changes Graph cannot make (e.g. deleting thousands of named ranges);
+    refused if anyone edited the file since the snapshot. Confirm replace with the user first."""
+    act = action.lower().strip()
+    if act == "list":
+        q = name.strip().lower()
+        r = _graph("GET", "/me/drive/root/children?$select=name,lastModifiedDateTime&$orderby=lastModifiedDateTime desc&$top=200")
+        seen = {}
+        for it in r.get("value", []):  # own OneDrive root: immediate, even for a file created seconds ago
+            if it["name"].lower().endswith((".xlsx", ".xlsm")) and q in it["name"].lower():
+                seen[it["name"]] = it["lastModifiedDateTime"][:16]
+        if q:
+            for h in _search_books(q):  # shared files and subfolders (the search index lags a few minutes)
+                seen.setdefault(h["name"], h["modified"])
+        return "\n".join(f"  {n}  (modified {m})" for n, m in list(seen.items())[:60]) or "no Excel files found"
+    b = _book()
+    base = f"/drives/{b['drive']}/items/{b['item']}"
+    if act == "copy":
+        if not name.strip():
+            return "copy needs name"
+        if not name.lower().endswith((".xlsx", ".xlsm")):
+            name += ".xlsx"
+        _flush_all()
+        parent = _graph("GET", base + "?$select=parentReference")["parentReference"]["id"]
+        _graph("POST", base + "/copy", {"name": name})  # accepted (202); the copy lands next to the source
+        it = None
+        for _ in range(40):
+            time.sleep(1.5)
+            try:
+                it = _graph("GET", f"/drives/{b['drive']}/items/{parent}:/{name}:?$select=id,name")
+                break
+            except GraphError:
+                pass
+        if not it:
+            return f"copy requested, but '{name}' has not appeared yet - xl_open('{name}') in a minute"
+        _open_item({"name": it["name"], "drive": b["drive"], "item": it["id"]})
+        return f"copied and opened {it['name']!r} - it is now this chat's workbook\n" + xl_file("link")
+    if act == "link":
+        r = _graph("POST", base + "/createLink", {"type": "edit", "scope": "organization"})
+        return f"edit link (organisation): {r.get('link', {}).get('webUrl', '?')}"
+    if act == "save":
+        _flush_all()
+        return "saved: pending edits are in the file"
+    if act == "calc":
+        _wb("POST", "/application/calculate", {"calculationType": "Full"})
+        mode = _wb("GET", "/application").get("calculationMode")
+        _commit()
+        return f"recalculated (calculation mode: {mode})"
+    if act == "snapshot":
+        _flush_all()
+        snap = _snapshot(force=True)
+        return (f"{os.path.join(_snap_dir(), 'latest.xlsx')}\n(last saved {snap['modified']} by {snap['by']}; read-only copy: "
+                "analyse it, but make changes through xl_write - or xl_file replace for what Graph cannot do)")
+    if act == "replace":
+        if not path or not os.path.isfile(path) or not path.lower().endswith((".xlsx", ".xlsm")):
+            return "replace needs path to a local .xlsx/.xlsm file"
+        latest_meta = os.path.join(_snap_dir(), "latest.json")
+        if not os.path.exists(latest_meta):
+            return "REFUSED: take xl_file snapshot first, make the offline changes on that copy, then replace"
+        _flush_all()
+        meta = _graph("GET", base + "?$select=cTag,lastModifiedDateTime,lastModifiedBy")
+        if json.load(open(latest_meta)).get("ctag") != meta["cTag"]:
+            who = meta.get("lastModifiedBy", {}).get("user", {}).get("displayName")
+            return (f"REFUSED: the file changed since your snapshot (last saved {meta['lastModifiedDateTime']} by {who}); "
+                    "uploading would discard those edits. Take a fresh snapshot, redo the offline changes on it, then replace.")
+        data = open(path, "rb").read()
+        try:
+            _upload(b["drive"], b["item"], data)
+        except (GraphError, urllib.error.HTTPError) as e:
+            code = getattr(e, "code", None) or (423 if " 423 " in str(e) else None)
+            if code == 423:
+                return "LOCKED: someone has the file open in Excel (desktop or browser). Ask them to close it, then retry."
+            return f"upload failed: {str(e)[:300]}"
+        _sessions.pop(b["item"], None)
+        _snaps.pop(b["item"], None)
+        _log({"ts": dt.datetime.now().isoformat(timespec="seconds"), "item": b["item"], "sheet": "", "range": "",
+              "old": None, "new": f"REPLACE FILE from {os.path.basename(path)} ({len(data) // 1024} KB)", "note": name,
+              "undone": "n/a (file)"})
+        snap = _snapshot(force=True)
+        return f"replaced {b['name']!r} with {os.path.basename(path)} ({len(data) // 1024} KB); saved {snap['modified']}"
+    return "action must be copy | link | list | snapshot | save | calc | replace"
 
 
 @mcp.tool()
 def xl_api(method: str, path: str, body: dict | None = None) -> str:
-    """Escape hatch to the full Microsoft Graph API for anything the other tools don't cover.
-    path starting with '/workbook' or a relative path ('/names', '/tables', '/worksheets(\\'BS\\')/charts', '/application/calculate')
-    runs against the CURRENT workbook in its session; any other '/...' path is a raw Graph v1.0 call
-    (e.g. '/me/drive/root/children', '/drives/{id}/items/{id}/copy'). method: GET | POST | PATCH | PUT | DELETE.
-    Examples: recalc -> POST /application/calculate {"calculationType":"Full"}; named ranges -> GET /names;
-    protect sheet -> POST /worksheets('BS')/protection/protect; table rows -> POST /tables/Table1/rows/add {"values":[[...]]}."""
+    """Raw Microsoft Graph for anything else. Relative path = the open workbook (/names, /tables, /worksheets('BS')/charts,
+    /application/calculate); absolute (/me/..., /drives/...) = plain Graph v1.0. Not available on Graph: cell comments,
+    freeze panes, conditional formats."""
     method = method.upper()
     wb_path = path[len("/workbook"):] if path.startswith("/workbook") else path
     is_workbook = path.startswith("/workbook") or not path.startswith(("/me", "/drives", "/sites", "/users", "/shares", "/groups", "/search"))
