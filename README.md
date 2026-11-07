@@ -41,7 +41,7 @@ It's a Claude Code plugin with an MCP server (Model Context Protocol, the standa
 | `xl_format` | Number formats, font, fill, wrap, alignment, column width/autofit, borders, hide/unhide rows or columns; many areas with different formats in one call |
 | `xl_shift` | Insert or delete cells, rows or columns |
 | `xl_sheet` | List, add, delete, hide, unhide, rename, reorder and colour worksheets |
-| `xl_file` | Server-side copy of the workbook (e.g. next month's file), org-wide edit link, list your files, local snapshot for pandas/openpyxl, save now, full recalculation, and a guarded whole-file replace for changes Graph can't make |
+| `xl_file` | Server-side copy of the workbook (e.g. next month's file), org-wide edit link, list your files, local snapshot for pandas/openpyxl, save now, full recalculation, **paste a local xlsx/csv into a sheet without the values passing through the chat** (e.g. an SAP TB export), and a guarded whole-file replace for changes Graph can't make |
 | `xl_api` | Direct access to the Microsoft Graph API for anything else |
 
 Each Claude chat opens its own workbook with `xl_open`, and that chat remembers it, even after Claude restarts the connector. Tools never act on a workbook another chat opened. To work across two workbooks in one chat, add `workbook=<file name>` to any tool.

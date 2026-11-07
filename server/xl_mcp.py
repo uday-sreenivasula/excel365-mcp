@@ -52,7 +52,7 @@ from openpyxl.formula.tokenizer import Token, Tokenizer
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter, column_index_from_string, range_boundaries
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 TENANT = os.environ.get("EXCEL365_TENANT", "").strip() or "organizations"  # "organizations" = any work/school account
 CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Microsoft Graph Command Line Tools
@@ -1871,11 +1871,35 @@ def _upload(drive, item, data):
     return json.loads(body) if body else {}
 
 
+def _read_table(path, sheet=""):
+    """Rows of a local .csv/.xlsx/.xlsm as JSON-ready values (numbers stay numbers; dates -> Excel serials)."""
+    from openpyxl.utils.datetime import to_excel
+    rows = []
+    if path.lower().endswith(".csv"):
+        import csv
+        num = re.compile(r"^-?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?$")
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for r in csv.reader(f):
+                rows.append([float(v.replace(",", "")) if num.fullmatch(v.strip()) else v for v in r])
+    else:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.worksheets[0]
+        for r in ws.iter_rows(values_only=True):
+            rows.append(["" if v is None else to_excel(v) if isinstance(v, (dt.datetime, dt.date)) else
+                         f"'{v}" if isinstance(v, str) and v.startswith("=") else v for v in r])
+        wb.close()
+    while rows and all(v in ("", None) for v in rows[-1]):
+        rows.pop()
+    return rows
+
+
 @mcp.tool()
-def xl_file(action: str, name: str = "", path: str = "") -> str:
+def xl_file(action: str, name: str = "", path: str = "", address: str = "") -> str:
     """File-level actions. copy: server-side copy of the open workbook as `name`, then opens it | link: org-wide edit
     link | list: your Excel files (matching `name`) | snapshot: local path of an up-to-date read-only copy for
-    openpyxl/pandas | save: flush pending edits now | calc: full recalculation | replace: upload the local file at
+    openpyxl/pandas | save: flush pending edits now | calc: full recalculation | paste: write the rows of the local
+    xlsx/csv at `path` into the sheet at `address` (top-left cell; `name` = source sheet), values only, nothing echoed
+    back, stale rows below cleared - the way to load an SAP export such as the TB | replace: upload the local file at
     `path` over the open workbook, only for changes Graph cannot make (e.g. deleting thousands of named ranges);
     refused if anyone edited the file since the snapshot. Confirm replace with the user first."""
     act = action.lower().strip()
@@ -1928,6 +1952,36 @@ def xl_file(action: str, name: str = "", path: str = "") -> str:
         snap = _snapshot(force=True)
         return (f"{os.path.join(_snap_dir(), 'latest.xlsx')}\n(last saved {snap['modified']} by {snap['by']}; read-only copy: "
                 "analyse it, but make changes through xl_write - or xl_file replace for what Graph cannot do)")
+    if act == "paste":
+        if not path or not os.path.isfile(path) or not path.lower().endswith((".xlsx", ".xlsm", ".csv")):
+            return "paste needs path to a local .xlsx/.xlsm/.csv file"
+        if not address:
+            return "paste needs address: the top-left cell, e.g. 'SAP TB'!A1"
+        sheet, rng = _split(address)
+        c1, r1 = range_boundaries(rng)[:2]
+        rows = _read_table(path, name)
+        if not rows:
+            return "source file is empty"
+        width = max(len(r) for r in rows)
+        rows = [list(r) + [""] * (width - len(r)) for r in rows]
+        step = max(1, 8000 // width)
+        for i in range(0, len(rows), step):
+            block = rows[i:i + step]
+            sub = f"{get_column_letter(c1)}{r1 + i}:{get_column_letter(c1 + width - 1)}{r1 + i + len(block) - 1}"
+            _wb("PATCH", f"{_sheet_path(sheet)}/range(address='{sub}')", {"values": block})
+        end_row = r1 + len(rows) - 1
+        used = _wb("GET", f"{_sheet_path(sheet)}/usedRange(valuesOnly=true)?$select=address")["address"]
+        last_used = range_boundaries(_split(used)[1])[3]
+        cleared = 0
+        if last_used > end_row:  # last month's export was longer: clear what it left behind
+            _wb("POST", f"{_sheet_path(sheet)}/range(address='{get_column_letter(c1)}{end_row + 1}:{get_column_letter(c1 + width - 1)}{last_used}')/clear",
+                {"applyTo": "Contents"})
+            cleared = last_used - end_row
+        _log({"ts": dt.datetime.now().isoformat(timespec="seconds"), "item": b["item"], "sheet": sheet, "range": rng,
+              "old": None, "new": f"PASTE {os.path.basename(path)} {len(rows)}x{width}", "note": name, "undone": "n/a (bulk paste)"})
+        _commit()
+        return (f"pasted {len(rows)} rows x {width} columns from {os.path.basename(path)} into {_q(sheet)}!{get_column_letter(c1)}{r1}:"
+                f"{get_column_letter(c1 + width - 1)}{end_row}; cleared {cleared} stale row(s) below (values not echoed)")
     if act == "replace":
         if not path or not os.path.isfile(path) or not path.lower().endswith((".xlsx", ".xlsm")):
             return "replace needs path to a local .xlsx/.xlsm file"
@@ -1955,7 +2009,7 @@ def xl_file(action: str, name: str = "", path: str = "") -> str:
               "undone": "n/a (file)"})
         snap = _snapshot(force=True)
         return f"replaced {b['name']!r} with {os.path.basename(path)} ({len(data) // 1024} KB); saved {snap['modified']}"
-    return "action must be copy | link | list | snapshot | save | calc | replace"
+    return "action must be copy | link | list | snapshot | save | calc | paste | replace"
 
 
 @mcp.tool()
